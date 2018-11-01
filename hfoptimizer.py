@@ -2,7 +2,6 @@
 # Author: MoonLight, 2018
 
 import sys
-import numpy as np
 import tensorflow as tf
 
 
@@ -233,7 +232,7 @@ class HFOptimizer(object):
                 stop = (dl_track[i + 1] - dl_track[i + 1 - k]) / dl_track[
                     i + 1
                 ]
-                if not np.isnan(stop) and stop < 1e-4:
+                if not tf.debugging.is_nan(stop) and stop < 1e-4:
                     break
 
         if debug_print:
@@ -302,7 +301,7 @@ class HFOptimizer(object):
                 ]
                 prec = [
                     (sum(tensor) + self.damping) ** (-0.75)
-                    for tensor in np.transpose(np.array(prec))
+                    for tensor in tf.transpose(tf.constant(prec))
                 ]
 
             Ax = None
