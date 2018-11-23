@@ -377,7 +377,7 @@ class HFOptimizer(tf.train.Optimizer):
         dl_track = tf.expand_dims(self.ops["dl"], axis=0)
 
         combined_op_1 = tf.group(
-            [loss_before_cg, dl_track[0], self.ops["set_delta_0"]]
+            loss_before_cg, dl_track[0], self.ops["set_delta_0"]
         )
         with tf.control_dependencies([combined_op_1]):
             with tf.variable_scope("for_loop"):
@@ -437,7 +437,7 @@ class HFOptimizer(tf.train.Optimizer):
                 parallel_iterations=1,
                 maximum_iterations=self.cg_max_iters,
             )
-            loop_vars = tf.group([i, stop])
+            loop_vars = tf.group(i, stop)
 
         if self.verbose:
             tf.logging.info("\n")
@@ -447,7 +447,7 @@ class HFOptimizer(tf.train.Optimizer):
             dl = tf.identity(self.ops["dl"])
             self.damp_pl = self.damping
 
-        combined_op_2 = tf.group([loop_vars, dl, self.ops["train"]])
+        combined_op_2 = tf.group(loop_vars, dl, self.ops["train"])
         with tf.control_dependencies([combined_op_2]):
             if self.adjust_damping:
                 loss_after_cg = tf.identity(self.loss)
@@ -472,7 +472,7 @@ class HFOptimizer(tf.train.Optimizer):
                     elseif,
                 )
 
-            return tf.group([combined_op_2, self.damping])
+            return tf.group(combined_op_2, self.damping)
 
     def __conjugate_gradient(self, gradients):
         """Perform conjugate gradient method.
