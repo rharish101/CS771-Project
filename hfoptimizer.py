@@ -232,7 +232,10 @@ class HFOptimizer(object):
                 stop = (dl_track[i + 1] - dl_track[i + 1 - k]) / dl_track[
                     i + 1
                 ]
-                if not tf.debugging.is_nan(stop) and stop < 1e-4:
+                if (
+                    not self.sess.run(tf.debugging.is_nan(stop), feed_dict)
+                    and stop < 1e-4
+                ):
                     break
 
         if debug_print:

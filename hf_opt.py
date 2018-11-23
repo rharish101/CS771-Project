@@ -397,13 +397,13 @@ class HFOptimizer(tf.train.Optimizer):
                 k = tf.maximum(self.gap, i // self.gap)
 
                 rn = tf.identity(self.ops["res_norm"])
-                with tf.control_dependencies([printer, rn]):
+                with tf.control_dependencies(
+                    [printer, rn, self.ops["cg_update"]]
+                ):
+                    self.ops["cg_update"] = self.ops["cg_update"]
                     stop = tf.cond(
                         rn < self.cg_num_err, lambda: True, lambda: stop
                     )
-
-                cg_update = self.ops["cg_update"]
-                with tf.control_dependencies([cg_update]):
                     dl_track = tf.concat(
                         [dl_track, tf.expand_dims(self.ops["dl"], axis=0)],
                         axis=0,
@@ -439,10 +439,7 @@ class HFOptimizer(tf.train.Optimizer):
                 parallel_iterations=1,
                 maximum_iterations=self.cg_max_iters,
             )
-            loop_vars = tf.group(i, stop)
-
-        if self.verbose:
-            tf.logging.info("\n")
+            loop_vars = tf.group(i, stop, dl_track)
 
         if self.adjust_damping:
             self.damp_pl = tf.constant(0.0)
@@ -451,7 +448,10 @@ class HFOptimizer(tf.train.Optimizer):
         else:
             dl = tf.no_op()
 
-        combined_op_2 = tf.group(loop_vars, dl, self.ops["train"])
+        printer = tf.cond(
+            stop, lambda: tf.print("Stopped"), lambda: tf.no_op()
+        )
+        combined_op_2 = tf.group(printer, loop_vars, dl, self.ops["train"])
         with tf.control_dependencies([combined_op_2]):
             if self.adjust_damping:
                 loss_after_cg = tf.identity(self.loss)
@@ -579,6 +579,7 @@ class HFOptimizer(tf.train.Optimizer):
             alpha = tf.reduce_sum(
                 [tf.reduce_sum(d * ad) for d, ad in zip(d, Ad)]
             )
+            oalpha = alpha
             alpha = residual_norm / alpha
 
             if self.use_prec:
@@ -605,7 +606,7 @@ class HFOptimizer(tf.train.Optimizer):
                     delta, delta + alpha * d[i], name="update_delta"
                 )
                 update_residual = tf.assign(
-                    self.get_slot(self.W[i], "residual"),
+                    self.get_slot(w, "residual"),
                     r[i] - alpha * Ad[i],
                     name="update_residual",
                 )
@@ -613,13 +614,17 @@ class HFOptimizer(tf.train.Optimizer):
                 if self.use_prec:
                     p = prec[i]
                 update_direction = tf.assign(
-                    self.get_slot(self.W[i], "direction"),
+                    self.get_slot(w, "direction"),
                     p * (r[i] - alpha * Ad[i]) + beta * d[i],
                     name="update_direction",
                 )
                 cg_update_ops.append(update_delta)
                 cg_update_ops.append(update_residual)
                 cg_update_ops.append(update_direction)
+                cg_update_ops.append(tf.print("Old Alpha = ", oalpha))
+                cg_update_ops.append(tf.print("Alpha = ", alpha))
+                cg_update_ops.append(tf.print("Beta = ", beta))
+                cg_update_ops.append(tf.print("Res norm = ", residual_norm))
 
             with tf.control_dependencies(cg_update_ops):
                 cg_update_ops.append(
@@ -630,7 +635,7 @@ class HFOptimizer(tf.train.Optimizer):
                         1,
                     )
                 )
-            cg_op = tf.group(*cg_update_ops)
+            cg_op = tf.group(*cg_update_ops, name="cg_op")
 
         dl = tf.reduce_sum(
             [
@@ -638,7 +643,8 @@ class HFOptimizer(tf.train.Optimizer):
                     0.5 * (delta * ax) + grad * self.get_slot(w, "delta")
                 )
                 for w, grad, ax in zip(self.W, gradients, Ax)
-            ]
+            ],
+            name="dl",
         )
 
         return cg_op, residual_norm, dl
