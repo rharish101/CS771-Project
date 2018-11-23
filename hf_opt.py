@@ -225,7 +225,7 @@ class HFOptimizer(tf.train.Optimizer):
         else:
             self.W = var_list
 
-        grad_and_vars = super().compute_gradients(
+        return super().compute_gradients(
             loss=loss,
             var_list=var_list,
             gate_gradients=gate_gradients,
@@ -233,9 +233,6 @@ class HFOptimizer(tf.train.Optimizer):
             colocate_gradients_with_ops=colocate_gradients_with_ops,
             grad_loss=grad_loss,
         )
-
-        self.grads = [grad for grad, var in grad_and_vars]
-        return grad_and_vars
 
     def _create_slots(self, var_list):
         first_var = min(var_list, key=lambda x: x.name)
@@ -247,16 +244,6 @@ class HFOptimizer(tf.train.Optimizer):
             self._zeros_slot(w, "delta", self._name)
             self._zeros_slot(w, "direction", self._name)
             self._zeros_slot(w, "residual", self._name)
-
-    def _prepare(self):
-        cg_op, res_norm, dl = self.__conjugate_gradient(self.grads)
-        self.ops = {
-            "cg_update": cg_op,
-            "res_norm": res_norm,
-            "dl": dl,
-            "set_delta_0": self.__update_delta_0(),
-            "train": self.__train_op(),
-        }
 
     def minimize(
         self,
@@ -340,13 +327,49 @@ class HFOptimizer(tf.train.Optimizer):
         )
 
     def _apply_dense(self, grad, var):
-        """Perform main training operations.
+        """Do nothing, as everything is done in __train."""
+        return tf.no_op()
 
-        grad: Tensorflow tensor object
-            List of gradients of loss w.r.t. var
-        var: Tensorflow tensor object
-            List of variables to train
+    def apply_gradients(self, grads_and_vars, global_step=None, name=None):
+        """Apply gradients to variables.
+
+        This is the second part of `minimize()`. It returns an `Operation` that
+        applies gradients.
+
+        Args:
+            grads_and_vars: List of (gradient, variable) pairs as returned by
+                `compute_gradients()`.
+            global_step: Optional `Variable` to increment by one after the
+                variables have been updated.
+            name: Optional name for the returned operation.  Default to the
+                name passed to the `Optimizer` constructor.
+
+        Returns:
+            An `Operation` that applies the specified gradients. If
+            `global_step` was not None, that operation also increments
+            `global_step`.
+
+        Raises:
+            TypeError: If `grads_and_vars` is malformed.
+            ValueError: If none of the variables have gradients.
+            RuntimeError: If you should use `_distributed_apply()` instead.
+
         """
+        super().apply_gradients(grads_and_vars, global_step, name)
+        with tf.name_scope(name, self._name):
+            grads = [grad for grad, var in grads_and_vars]
+            cg_op, res_norm, dl = self.__conjugate_gradient(grads)
+            self.ops = {
+                "cg_update": cg_op,
+                "res_norm": res_norm,
+                "dl": dl,
+                "set_delta_0": self.__update_delta_0(),
+                "train": self.__train_op(),
+            }
+            return self.__train()
+
+    def __train(self):
+        """Perform main training operations."""
         self.damp_pl = self.damping
         if self.adjust_damping:
             loss_before_cg = tf.identity(self.loss)
