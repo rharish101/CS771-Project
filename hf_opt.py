@@ -98,7 +98,7 @@ class HFOptimizer(tf.train.Optimizer):
         self.use_prec = preconditioner
         self.learning_rate = learning_rate
         self.use_gnm = use_gauss_newton_matrix
-        self.damping = damping
+        self.damping = tf.constant(damping)
         self.gap = gap
         self.cg_max_iters = cg_max_iters
         self.adjust_damping = adjust_damping
@@ -373,6 +373,8 @@ class HFOptimizer(tf.train.Optimizer):
         self.damp_pl = self.damping
         if self.adjust_damping:
             loss_before_cg = tf.identity(self.loss)
+        else:
+            loss_before_cg = tf.no_op()
 
         dl_track = tf.expand_dims(self.ops["dl"], axis=0)
 
@@ -386,16 +388,16 @@ class HFOptimizer(tf.train.Optimizer):
 
             def loop(i, stop, dl_track):
                 if self.verbose:
-                    tf.logging.info(
-                        clr.OKGREEN
-                        + "\r[CG iteration: {}]".format(i)
-                        + clr.ENDC
+                    printer = tf.print(
+                        clr.OKGREEN + "\r[CG iteration: ", i, "]" + clr.ENDC
                     )
+                else:
+                    printer = tf.no_op
 
                 k = tf.maximum(self.gap, i // self.gap)
 
                 rn = tf.identity(self.ops["res_norm"])
-                with tf.control_dependencies([rn]):
+                with tf.control_dependencies([printer, rn]):
                     stop = tf.cond(
                         rn < self.cg_num_err, lambda: True, lambda: stop
                     )
@@ -425,7 +427,7 @@ class HFOptimizer(tf.train.Optimizer):
 
             i, stop, dl_track = tf.while_loop(
                 lambda i, stop, dl_track: tf.logical_and(
-                    i < self.cg_max_iters, stop
+                    i < self.cg_max_iters, tf.logical_not(stop)
                 ),
                 loop,
                 (i, stop, dl_track),
@@ -446,6 +448,8 @@ class HFOptimizer(tf.train.Optimizer):
             self.damp_pl = tf.constant(0.0)
             dl = tf.identity(self.ops["dl"])
             self.damp_pl = self.damping
+        else:
+            dl = tf.no_op()
 
         combined_op_2 = tf.group(loop_vars, dl, self.ops["train"])
         with tf.control_dependencies([combined_op_2]):
