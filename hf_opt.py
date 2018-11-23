@@ -7,6 +7,11 @@ Modified by: rharish, 2018
 
 import tensorflow as tf
 
+try:
+    import colored_traceback.auto
+except ImportError:
+    pass
+
 
 class clr:
     """Used for color debug output to console."""
@@ -85,6 +90,8 @@ class HFOptimizer(tf.train.Optimizer):
         dtype: Tensorflow type
             Type of Tensorflow variables.
         """
+        super().__init__(True, "HFOptimizer")
+
         self.cg_decay = cg_decay
         self.prec_loss = prec_loss
         self.batch_size = batch_size
@@ -95,7 +102,7 @@ class HFOptimizer(tf.train.Optimizer):
         self.gap = gap
         self.cg_max_iters = cg_max_iters
         self.adjust_damping = adjust_damping
-        self.damp_pl = tf.placeholder(dtype, shape=())
+        self.damp_pl = tf.constant(0.0)
         self.dtype = dtype
 
         self.cg_num_err = HFOptimizer.CG_NUMERICAL_ERROR_STOP_FLOAT32
@@ -166,7 +173,6 @@ class HFOptimizer(tf.train.Optimizer):
         aggregation_method=None,
         colocate_gradients_with_ops=False,
         grad_loss=None,
-        debug_print=False,
     ):
         """Compute gradients of `loss` for the variables in `var_list`.
 
@@ -219,36 +225,6 @@ class HFOptimizer(tf.train.Optimizer):
         else:
             self.W = var_list
 
-        with tf.name_scope("cg_vars"):
-            self.cg_step = tf.get_variable(
-                "cg_step",
-                trainable=False,
-                initializer=tf.zeros_initializer,
-                dtype=tf.int32,
-            )
-            self.cg_delta = []
-            self.directions = []
-            self.residuals = []
-            for w in self.W:
-                delta = tf.get_variable(
-                    name="delta",
-                    initializer=tf.zeros_initializer,
-                    dtype=self.dtype,
-                )
-                self.cg_delta.append(delta)
-                d = tf.get_variable(
-                    name="direction",
-                    dtype=self.dtype,
-                    initializer=tf.zeros_initializer,
-                )
-                self.directions.append(d)
-                r = tf.get_variable(
-                    name="residual",
-                    dtype=self.dtype,
-                    initializer=tf.zeros_initializer,
-                )
-                self.residuals.append(r)
-
         grad_and_vars = super().compute_gradients(
             loss=loss,
             var_list=var_list,
@@ -257,11 +233,23 @@ class HFOptimizer(tf.train.Optimizer):
             colocate_gradients_with_ops=colocate_gradients_with_ops,
             grad_loss=grad_loss,
         )
+
         self.grads = [grad for grad, var in grad_and_vars]
         return grad_and_vars
 
+    def _create_slots(self, var_list):
+        first_var = min(var_list, key=lambda x: x.name)
+        self._create_non_slot_variable(
+            initial_value=0, name="cg_step", colocate_with=first_var
+        )
+
+        for w in var_list:
+            self._zeros_slot(w, "delta", self._name)
+            self._zeros_slot(w, "direction", self._name)
+            self._zeros_slot(w, "residual", self._name)
+
     def _prepare(self):
-        cg_op, res_norm, dl = self.__conjugate_gradient(self.gradients)
+        cg_op, res_norm, dl = self.__conjugate_gradient(self.grads)
         self.ops = {
             "cg_update": cg_op,
             "res_norm": res_norm,
@@ -281,6 +269,7 @@ class HFOptimizer(tf.train.Optimizer):
         colocate_gradients_with_ops=False,
         name=None,
         grad_loss=None,
+        verbose=False,
     ):
         """Add operations to minimize `loss` by updating `var_list`.
 
@@ -310,6 +299,8 @@ class HFOptimizer(tf.train.Optimizer):
             name: Optional name for the returned operation.
             grad_loss: Optional. A `Tensor` holding the gradient computed for
                 `loss`.
+            verbose: bool
+                If True prints CG iteration number.
 
         Returns:
             An Operation that updates the variables in `var_list`.  If
@@ -322,7 +313,10 @@ class HFOptimizer(tf.train.Optimizer):
         @compatibility(eager)
         Eager execution not supported.
         @end_compatibility
+
         """
+        self.verbose = verbose
+
         grads_and_vars = self.compute_gradients(
             loss,
             output,
@@ -345,67 +339,112 @@ class HFOptimizer(tf.train.Optimizer):
             grads_and_vars, global_step=global_step, name=name
         )
 
-    def _apply_dense(self, loss, debug_print=False):
+    def _apply_dense(self, grad, var):
         """Perform main training operations.
 
-        loss: Tensorflow tensor object
-            Loss function of the neural network.
-        feed_dict: dictionary
-            Input training batch.
-        debug_print: bool
-            If True prints CG iteration number.
+        grad: Tensorflow tensor object
+            List of gradients of loss w.r.t. var
+        var: Tensorflow tensor object
+            List of variables to train
         """
-        cg_step = tf.assign(self.cg_step, 0)
-
+        self.damp_pl = self.damping
         if self.adjust_damping:
             loss_before_cg = tf.identity(self.loss)
 
-        dl_track = [tf.identity(self.ops["dl"])]
+        dl_track = tf.expand_dims(self.ops["dl"], axis=0)
 
         combined_op_1 = tf.group(
-            [cg_step, loss_before_cg, dl_track[0], self.ops["set_delta_0"]]
+            [loss_before_cg, dl_track[0], self.ops["set_delta_0"]]
         )
         with tf.control_dependencies([combined_op_1]):
-            for i in range(self.cg_max_iters):
-                if debug_print:
-                    d_info = (
+            with tf.variable_scope("for_loop"):
+                i = tf.constant(0)
+                stop = tf.constant(False)
+
+            def loop(i, stop, dl_track):
+                if self.verbose:
+                    tf.logging.info(
                         clr.OKGREEN
                         + "\r[CG iteration: {}]".format(i)
                         + clr.ENDC
                     )
-                    tf.logging.info(d_info)
+
+                k = tf.maximum(self.gap, i // self.gap)
 
                 rn = tf.identity(self.ops["res_norm"])
                 with tf.control_dependencies([rn]):
-                    if rn < self.cg_num_err:
-                        break
+                    stop = tf.cond(
+                        rn < self.cg_num_err, lambda: True, lambda: stop
+                    )
 
-                with tf.control_dependencies(self.ops["cg_update"]):
-                    dl_track.append(tf.identity(self.ops["dl"]))
+                cg_update = self.ops["cg_update"]
+                with tf.control_dependencies([cg_update]):
+                    dl_track = tf.concat(
+                        [dl_track, tf.expand_dims(self.ops["dl"], axis=0)],
+                        axis=0,
+                    )
 
-        if debug_print:
+                def early_stop():
+                    margin = (
+                        dl_track[i + 1] - dl_track[i + 1 - k]
+                    ) / dl_track[i + 1]
+                    return tf.cond(
+                        tf.logical_and(
+                            tf.debugging.is_nan(margin), margin < 1e-4
+                        ),
+                        lambda: True,
+                        lambda: stop,
+                    )
+
+                stop = tf.cond(i > k, early_stop, lambda: stop)
+                i += 1
+                return i, stop, dl_track
+
+            i, stop, dl_track = tf.while_loop(
+                lambda i, stop, dl_track: tf.logical_and(
+                    i < self.cg_max_iters, stop
+                ),
+                loop,
+                (i, stop, dl_track),
+                shape_invariants=(
+                    i.get_shape(),
+                    stop.get_shape(),
+                    tf.TensorShape([None]),
+                ),
+                parallel_iterations=1,
+                maximum_iterations=self.cg_max_iters,
+            )
+            loop_vars = tf.group([i, stop])
+
+        if self.verbose:
             tf.logging.info("\n")
 
         if self.adjust_damping:
+            self.damp_pl = tf.constant(0.0)
             dl = tf.identity(self.ops["dl"])
+            self.damp_pl = self.damping
 
-        combined_op_2 = tf.group([dl_track[-1], dl, self.ops["train"]])
+        combined_op_2 = tf.group([loop_vars, dl, self.ops["train"]])
         with tf.control_dependencies([combined_op_2]):
             if self.adjust_damping:
                 loss_after_cg = tf.identity(self.loss)
                 reduction_ratio = (loss_after_cg - loss_before_cg) / dl
 
                 def elseif():
-                    tf.cond(
-                        reduction_ratio > 0.75
-                        and self.damping > self.damp_num_err,
+                    return tf.cond(
+                        tf.logical_and(
+                            reduction_ratio > 0.75,
+                            self.damping > self.damp_num_err,
+                        ),
                         lambda: self.damping / 1.5,
                         lambda: self.damping,
                     )
 
                 self.damping = tf.cond(
-                    reduction_ratio < 0.25
-                    and self.damping > self.damp_num_err,
+                    tf.logical_and(
+                        reduction_ratio < 0.25,
+                        self.damping > self.damp_num_err,
+                    ),
                     lambda: self.damping * 1.5,
                     elseif,
                 )
@@ -465,29 +504,41 @@ class HFOptimizer(tf.train.Optimizer):
 
             Ax = None
             if self.use_gnm:
-                Ax = self.__Gv(self.cg_delta)
+                Ax = self.__Gv([self.get_slot(w, "delta") for w in self.W])
             else:
-                Ax = self.__Hv(gradients, self.cg_delta)
+                Ax = self.__Hv(
+                    gradients, [self.get_slot(w, "delta") for w in self.W]
+                )
 
             b = [-grad for grad in gradients]
             bAx = [b - Ax for b, Ax in zip(b, Ax)]
 
-            condition = tf.equal(self.cg_step, 0)
+            condition = tf.equal(
+                self._get_non_slot_variable("cg_step", self.W[0].graph), 0
+            )
             r = [
                 tf.cond(condition, lambda: tf.assign(r, bax), lambda: r)
-                for r, bax in zip(self.residuals, bAx)
+                for r, bax in zip(
+                    [self.get_slot(w, "residual") for w in self.W], bAx
+                )
             ]
 
             d = None
             if self.use_prec:
                 d = [
                     tf.cond(condition, lambda: tf.assign(d, p * r), lambda: d)
-                    for p, d, r in zip(prec, self.directions, r)
+                    for p, d, r in zip(
+                        prec,
+                        [self.get_slot(w, "direction") for w in self.W],
+                        r,
+                    )
                 ]
             else:
                 d = [
                     tf.cond(condition, lambda: tf.assign(d, r), lambda: d)
-                    for d, r in zip(self.directions, r)
+                    for d, r in zip(
+                        [self.get_slot(w, "direction") for w in self.W], r
+                    )
                 ]
 
             Ad = None
@@ -521,12 +572,13 @@ class HFOptimizer(tf.train.Optimizer):
             self.beta = beta
             beta = beta / residual_norm
 
-            for i, delta in reversed(list(enumerate(self.cg_delta))):
+            for i, w in reversed(list(enumerate(self.W))):
+                delta = self.get_slot(w, "delta")
                 update_delta = tf.assign(
                     delta, delta + alpha * d[i], name="update_delta"
                 )
                 update_residual = tf.assign(
-                    self.residuals[i],
+                    self.get_slot(self.W[i], "residual"),
                     r[i] - alpha * Ad[i],
                     name="update_residual",
                 )
@@ -534,7 +586,7 @@ class HFOptimizer(tf.train.Optimizer):
                 if self.use_prec:
                     p = prec[i]
                 update_direction = tf.assign(
-                    self.directions[i],
+                    self.get_slot(self.W[i], "direction"),
                     p * (r[i] - alpha * Ad[i]) + beta * d[i],
                     name="update_direction",
                 )
@@ -543,13 +595,22 @@ class HFOptimizer(tf.train.Optimizer):
                 cg_update_ops.append(update_direction)
 
             with tf.control_dependencies(cg_update_ops):
-                cg_update_ops.append(tf.assign_add(self.cg_step, 1))
+                cg_update_ops.append(
+                    tf.assign_add(
+                        self._get_non_slot_variable(
+                            "cg_step", self.W[0].graph
+                        ),
+                        1,
+                    )
+                )
             cg_op = tf.group(*cg_update_ops)
 
         dl = tf.reduce_sum(
             [
-                tf.reduce_sum(0.5 * (delta * ax) + grad * delta)
-                for delta, grad, ax in zip(self.cg_delta, gradients, Ax)
+                tf.reduce_sum(
+                    0.5 * (delta * ax) + grad * self.get_slot(w, "delta")
+                )
+                for w, grad, ax in zip(self.W, gradients, Ax)
             ]
         )
 
@@ -583,18 +644,21 @@ class HFOptimizer(tf.train.Optimizer):
         """
         Jv = self.__Rop(self.output, self.W, vec)
         Jv = tf.reshape(tf.stack(Jv), [-1, 1])
-        HJv = tf.gradients(
-            tf.matmul(
-                tf.transpose(tf.gradients(self.loss, self.output)[0]), Jv
-            ),
-            self.output,
-            stop_gradients=Jv,
-        )[0]
-        JHJv = tf.gradients(
-            tf.matmul(tf.transpose(HJv), self.output),
-            self.W,
-            stop_gradients=HJv,
-        )
+        H = tf.transpose(tf.gradients(self.loss, self.output)[0])
+        if len(H.get_shape().as_list()) < 2:
+            HJv = tf.gradients(H * Jv, self.output, stop_gradients=Jv)[0]
+            JHJv = tf.gradients(
+                tf.transpose(HJv) * self.output, self.W, stop_gradients=HJv
+            )
+        else:
+            HJv = tf.gradients(
+                tf.matmul(H, Jv), self.output, stop_gradients=Jv
+            )[0]
+            JHJv = tf.gradients(
+                tf.matmul(tf.transpose(HJv), self.output),
+                self.W,
+                stop_gradients=HJv,
+            )
         JHJv = [gv + self.damp_pl * v for gv, v in zip(JHJv, vec)]
 
         return JHJv
@@ -631,10 +695,14 @@ class HFOptimizer(tf.train.Optimizer):
                     "batch_size in HFOptimizer initialization" + clr.ENDC
                 )
         else:
+            if len(f.get_shape().as_list()) == 0:
+                fn = tf.reshape(f, [1])
+            else:
+                fn = f
             r = [
                 tf.reduce_sum(
                     [
-                        tf.reduce_sum(v * tf.gradients(tf.gather(f, i), x)[j])
+                        tf.reduce_sum(v * tf.gradients(tf.gather(fn, i), x)[j])
                         for j, v in enumerate(vec)
                     ]
                 )
@@ -659,7 +727,8 @@ class HFOptimizer(tf.train.Optimizer):
             Update initial delta operation.
         """
         update_delta_0_ops = []
-        for delta in self.cg_delta:
+        for w in self.W:
+            delta = self.get_slot(w, "delta")
             update_delta = tf.assign(delta, self.cg_decay * delta)
             update_delta_0_ops.append(update_delta)
         update_delta_0_op = tf.group(*update_delta_0_ops)
@@ -673,10 +742,13 @@ class HFOptimizer(tf.train.Optimizer):
             Main training operations
         """
         update_ops = []
-        delta_and_vars = list(zip(self.cg_delta, self.W))
-        for delta, w in reversed(delta_and_vars):
+        for w in reversed(self.W):
             with tf.control_dependencies(update_ops):
-                update_ops.append(tf.assign(w, w + self.learning_rate * delta))
+                update_ops.append(
+                    tf.assign(
+                        w, w + self.learning_rate * self.get_slot(w, "delta")
+                    )
+                )
         training_op = tf.group(*update_ops)
 
         return training_op
