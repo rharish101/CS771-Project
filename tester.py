@@ -1,10 +1,48 @@
 #!/usr/bin/env python3
+"""MNIST fully-connected tester."""
 from __future__ import print_function
 import tensorflow as tf
 import os
 from hfoptimizer import HFOptimizer
 from datetime import datetime
+from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 
+# For commandline arguments
+parser = ArgumentParser(
+    description="Tester for fully-connected architeture on MNIST",
+    formatter_class=ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument(
+    "-o",
+    "--opt",
+    type=str,
+    choices=["adam", "hfopt"],
+    default="hfopt",
+    help="choice of the optimizer",
+)
+parser.add_argument(
+    "-l", "--logdir", type=str, default="./logdir", help="path for logging"
+)
+parser.add_argument(
+    "-d",
+    "--stop-delta",
+    type=float,
+    default=1e-3,
+    help="loss difference for early stopping",
+)
+parser.add_argument(
+    "-i",
+    "--stop-iter",
+    type=int,
+    default=5,
+    help="max number of iterations to watch for early stopping",
+)
+args = parser.parse_args()
+if args.logdir[-1] != "/":
+    args.logdir += "/"
+args.logdir += datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# Get a dataset object
 mnist = tf.contrib.learn.datasets.load_dataset("mnist")
 train_dataset = (
     tf.data.Dataset.from_tensor_slices(
@@ -25,51 +63,67 @@ iterator = tf.data.Iterator.from_structure(
 train_init_op = iterator.make_initializer(train_dataset)
 test_init_op = iterator.make_initializer(test_dataset)
 
-LOG_DIR = "logdir/" + datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-
+# Model definition
 x, y_ = iterator.get_next()
 y_ = tf.one_hot(y_, 10)
-W = tf.Variable(tf.zeros([784, 10]))
-b = tf.Variable(tf.zeros([10]))
 x = tf.identity(x, name="x")
-y = tf.matmul(x, W) + b
+# h = tf.layers.dense(x, 64, activation=tf.nn.relu)
+y = tf.layers.dense(x, 10)
 pred = tf.nn.softmax(y)
 
-cross_entropy = tf.reduce_mean(
+loss = tf.reduce_mean(
     tf.nn.softmax_cross_entropy_with_logits_v2(labels=y_, logits=y)
 )
-loss = tf.summary.scalar("loss", cross_entropy)
-# train_step = tf.train.AdamOptimizer().minimize(cross_entropy)
+tf.summary.scalar("loss", loss)
 
 prediction = tf.equal(tf.argmax(pred, 1), tf.argmax(y_, 1))
 accuracy = tf.reduce_mean(tf.cast(prediction, tf.float32)) * 100
-acc_summ = tf.summary.scalar("accuracy", accuracy)
+tf.summary.scalar("accuracy", accuracy)
 
-sess = tf.Session()
-opt = HFOptimizer(sess, cross_entropy, y)
-init = tf.global_variables_initializer()
-sess.run(init)
+merged = tf.summary.merge_all()
 
-saver = tf.train.Saver()
-writer = tf.summary.FileWriter(LOG_DIR)
+# For not hogging everything
+# gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.2)
+gpu_options = tf.GPUOptions(allow_growth=True)
 
-sess.run(train_init_op)
-prev_loss = 1e10
-EARLY_STOP = 2e-3
-try:
-    for step in range(1000):
-        # sess.run(train_step)
-        opt.minimize({})
-        summary, curr_loss, acc = sess.run([loss, cross_entropy, acc_summ])
-        writer.add_summary(summary, step)
-        print("\rStep {} done".format(step + 1), end="")
-        if step % 10 == 0:
-            saver.save(sess, os.path.join(LOG_DIR, "model.ckpt"), step)
-        if prev_loss - curr_loss < EARLY_STOP:
-            break
-except KeyboardInterrupt:
-    pass
-print("\n")
+with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
+    # train_step = tf.train.AdamOptimizer().minimize(loss)
+    opt = HFOptimizer(sess, loss, y)
 
-sess.run(test_init_op)
-print("Test Accuracy = {}%".format(sess.run(accuracy)))
+    # For profiling
+    # options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    # run_metadata = tf.RunMetadata()
+
+    init = tf.global_variables_initializer()
+    sess.run(init)
+
+    saver = tf.train.Saver()
+    writer = tf.summary.FileWriter(args.logdir)
+
+    # Training loop
+    sess.run(train_init_op)
+    prev_loss = 1e8
+    stop_iter = args.stop_iter
+    try:
+        for step in range(1000):
+            # sess.run(train_step)
+            opt.minimize({})
+            summary, curr_loss = sess.run([merged, loss])
+            writer.add_summary(summary, step)
+            print("\rStep {} done".format(step + 1), end="")
+            if step % 10 == 0:
+                saver.save(sess, os.path.join(args.logdir, "model.ckpt"), step)
+            if prev_loss - curr_loss < args.stop_delta:
+                stop_iter -= 1
+                if stop_iter <= 0:
+                    break
+            else:
+                stop_iter = args.stop_iter
+                prev_loss = curr_loss
+    except KeyboardInterrupt:
+        pass
+    print("")
+
+    # Test evaluation
+    sess.run(test_init_op)
+    print("Test Accuracy = {}%".format(sess.run(accuracy)))
