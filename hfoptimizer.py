@@ -46,6 +46,8 @@ class HFOptimizer(object):
         gap=10,
         cg_max_iters=50,
         dtype=tf.float32,
+        sess_opts=None,
+        sess_run_metadata=None,
     ):
         """ Creates Tensorflow graph and variables.
 
@@ -89,6 +91,10 @@ class HFOptimizer(object):
         cg_max_iters: int
             Number of maximum iterations of conjugate gradient computations.
         dtype: Tensorflow type
+            Type of Tensorflow variables.
+        sess_options: Tensorflow type
+            Type of Tensorflow variables.
+        sess_run_metadata: Tensorflow type
             Type of Tensorflow variables. """
 
         self.sess = sess
@@ -105,6 +111,8 @@ class HFOptimizer(object):
         self.cg_max_iters = cg_max_iters
         self.adjust_damping = adjust_damping
         self.damp_pl = tf.placeholder(dtype, shape=())
+        self.options = sess_opts
+        self.run_metadata = sess_run_metadata
 
         self.cg_num_err = HFOptimizer.CG_NUMERICAL_ERROR_STOP_FLOAT32
         self.damp_num_err = HFOptimizer.DUMPING_NUMERICAL_ERROR_STOP_FLOAT32
@@ -202,14 +210,34 @@ class HFOptimizer(object):
         debug_print: bool
             If True prints CG iteration number. """
 
-        self.sess.run(tf.assign(self.cg_step, 0))
+        self.sess.run(
+            tf.assign(self.cg_step, 0),
+            options=self.options,
+            run_metadata=self.run_metadata,
+        )
         feed_dict.update({self.damp_pl: self.damping})
 
         if self.adjust_damping:
-            loss_before_cg = self.sess.run(self.loss, feed_dict)
+            loss_before_cg = self.sess.run(
+                self.loss,
+                feed_dict,
+                options=self.options,
+                run_metadata=self.run_metadata,
+            )
 
-        dl_track = [self.sess.run(self.ops["dl"], feed_dict)]
-        self.sess.run(self.ops["set_delta_0"])
+        dl_track = [
+            self.sess.run(
+                self.ops["dl"],
+                feed_dict,
+                options=self.options,
+                run_metadata=self.run_metadata,
+            )
+        ]
+        self.sess.run(
+            self.ops["set_delta_0"],
+            options=self.options,
+            run_metadata=self.run_metadata,
+        )
 
         for i in range(self.cg_max_iters):
             if debug_print:
@@ -244,13 +272,28 @@ class HFOptimizer(object):
 
         if self.adjust_damping:
             feed_dict.update({self.damp_pl: 0})
-            dl = self.sess.run(self.ops["dl"], feed_dict)
+            dl = self.sess.run(
+                self.ops["dl"],
+                feed_dict,
+                options=self.options,
+                run_metadata=self.run_metadata,
+            )
             feed_dict.update({self.damp_pl: self.damping})
 
-        self.sess.run(self.ops["train"], feed_dict)
+        self.sess.run(
+            self.ops["train"],
+            feed_dict,
+            options=self.options,
+            run_metadata=self.run_metadata,
+        )
 
         if self.adjust_damping:
-            loss_after_cg = self.sess.run(self.loss, feed_dict)
+            loss_after_cg = self.sess.run(
+                self.loss,
+                feed_dict,
+                options=self.options,
+                run_metadata=self.run_metadata,
+            )
             reduction_ratio = (loss_after_cg - loss_before_cg) / dl
 
             if reduction_ratio < 0.25 and self.damping > self.damp_num_err:

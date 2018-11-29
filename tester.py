@@ -2,6 +2,7 @@
 """MNIST fully-connected tester."""
 from __future__ import print_function
 import tensorflow as tf
+from tensorflow.python.client import timeline
 import os
 from hfoptimizer import HFOptimizer
 from datetime import datetime
@@ -16,7 +17,7 @@ parser.add_argument(
     "-o",
     "--opt",
     type=str,
-    choices=["adam", "hfopt"],
+    choices=["adam", "sgd", "hfopt"],
     default="hfopt",
     help="choice of the optimizer",
 )
@@ -87,18 +88,24 @@ merged = tf.summary.merge_all()
 gpu_options = tf.GPUOptions(allow_growth=True)
 
 with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
-    # train_step = tf.train.AdamOptimizer().minimize(loss)
-    opt = HFOptimizer(sess, loss, y)
-
     # For profiling
-    # options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-    # run_metadata = tf.RunMetadata()
+    options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+    run_metadata = tf.RunMetadata()
+
+    if args.opt == "adam":
+        train_step = tf.train.AdamOptimizer().minimize(loss)
+    elif args.opt == "sgd":
+        train_step = tf.train.GradientDescentOptimizer(1e-2).minimize(loss)
+    elif args.opt == "hfopt":
+        opt = HFOptimizer(
+            sess, loss, y, sess_opts=options, sess_run_metadata=run_metadata
+        )
 
     init = tf.global_variables_initializer()
     sess.run(init)
 
     saver = tf.train.Saver()
-    writer = tf.summary.FileWriter(args.logdir)
+    # writer = tf.summary.FileWriter(args.logdir)
 
     # Training loop
     sess.run(train_init_op)
@@ -106,10 +113,14 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
     stop_iter = args.stop_iter
     try:
         for step in range(1000):
-            # sess.run(train_step)
-            opt.minimize({})
+            if args.opt == "hfopt":
+                opt.minimize({})
+            else:
+                sess.run(
+                    train_step, options=options, run_metadata=run_metadata
+                )
             summary, curr_loss = sess.run([merged, loss])
-            writer.add_summary(summary, step)
+            # writer.add_summary(summary, step)
             print("\rStep {} done".format(step + 1), end="")
             if step % 10 == 0:
                 saver.save(sess, os.path.join(args.logdir, "model.ckpt"), step)
@@ -127,3 +138,8 @@ with tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)) as sess:
     # Test evaluation
     sess.run(test_init_op)
     print("Test Accuracy = {}%".format(sess.run(accuracy)))
+
+    fetched_timeline = timeline.Timeline(run_metadata.step_stats)
+    chrome_trace = fetched_timeline.generate_chrome_trace_format()
+    with open(args.logdir + "/timeline_01.json", "w") as f:
+        f.write(chrome_trace)
